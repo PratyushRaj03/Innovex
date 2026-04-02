@@ -124,11 +124,15 @@ This project is licensed under the MIT License.
 
 ---
 
-## 👨‍💻 Author
+## 👨‍💻 Partners in Project
 
 **Pratyush Raj Srivastava**
+2301730043
 B.Tech CSE (AI/ML)
-Passionate about AI, Cloud Computing & Real-world Problem Solving 🚀
+
+**Aditya Naruka**
+2301730039
+B.Tech CSE (AI/ML)
 
 ---
 
