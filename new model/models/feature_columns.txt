@@ -1,0 +1,9 @@
+cpu_util
+memory_util
+disk_io
+network_traffic
+queue_length
+response_time
+load_score
+hour_of_day
+day_of_week
