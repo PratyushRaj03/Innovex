@@ -1,4 +1,3 @@
-# real_dataset_load_balancer_fixed_stream.py
 import numpy as np
 import pandas as pd
 import threading
@@ -42,6 +41,7 @@ def convert_to_native(obj):
     else:
         return obj
 
+
 class RealDatasetLoader:
     """Load real cloud workload datasets"""
     
@@ -54,50 +54,137 @@ class RealDatasetLoader:
         try:
             df = pd.read_csv(file_path)
             logger.info(f"Loaded {len(df)} records from {file_path}")
+            logger.info(f"Columns: {df.columns.tolist()}")
             return df
         except Exception as e:
             logger.error(f"Error loading CSV: {e}")
             return None
     
-    def preprocess_data(self, df, sample_size=5000):
-        """Preprocess data to match our format"""
+    def preprocess_data(self, df, sample_size=None):
+        """Preprocess data to match our format - No sampling to preserve all data"""
         if df is None:
             return None
         
         logger.info("Preprocessing data...")
+        logger.info(f"Original data shape: {df.shape}")
         
+        # Handle timestamp
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                logger.info("Timestamp column converted to datetime")
+            except:
+                logger.warning("Could not convert timestamp, creating sequential timestamps")
+                start_time = datetime(2024, 1, 1)
+                df['timestamp'] = [start_time + timedelta(seconds=i*60) for i in range(len(df))]
         else:
-            start_time = datetime(2024, 1, 1)
-            df['timestamp'] = [start_time + timedelta(minutes=i) for i in range(len(df))]
+            # Check for Task_Start_Time in your dataset
+            if 'Task_Start_Time' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['Task_Start_Time'])
+                logger.info("Task_Start_Time converted to timestamp")
+            else:
+                # Create sequential timestamps
+                start_time = datetime(2024, 1, 1)
+                df['timestamp'] = [start_time + timedelta(seconds=i*60) for i in range(len(df))]
+                logger.info("Created sequential timestamps")
         
+        # Verify timestamp is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            # Fill any NaT with sequential timestamps
+            if df['timestamp'].isna().any():
+                start_time = datetime(2024, 1, 1)
+                for i in range(len(df)):
+                    if pd.isna(df.loc[i, 'timestamp']):
+                        df.loc[i, 'timestamp'] = start_time + timedelta(seconds=i*60)
+        
+        # Handle VM ID - Check for Job_ID in your dataset
+        # NOTE: Job_ID is unique per row (JOB_1..JOB_5000), so we CANNOT use it
+        # directly as vm_id — that would give 5000 VMs with 1 record each, making
+        # LSTM sequence training impossible (needs >= sequence_length records per VM).
+        # Instead, we assign rows round-robin to a fixed number of virtual VMs so
+        # every VM gets enough records to build training sequences.
         if 'vm_id' not in df.columns:
-            df['vm_id'] = df.index % 8
+            if 'Job_ID' in df.columns:
+                N_VMS = 10  # number of virtual "servers" to simulate
+                df['vm_id'] = (df.index % N_VMS).astype(str)
+                logger.info(f"Job_ID is unique per row — assigning rows round-robin to {N_VMS} virtual VMs")
+            else:
+                df['vm_id'] = (df.index % 10).astype(str)
         df['vm_id'] = df['vm_id'].astype(str)
         
-        if 'cpu_util' in df.columns:
+        # Handle CPU utilization - Check for CPU_Utilization (%) in your dataset
+        if 'cpu_util' not in df.columns:
+            if 'CPU_Utilization (%)' in df.columns:
+                df['cpu_util'] = pd.to_numeric(df['CPU_Utilization (%)'], errors='coerce').fillna(50)
+                logger.info("Using CPU_Utilization (%) as cpu_util")
+            else:
+                df['cpu_util'] = np.random.uniform(10, 90, len(df))
+        else:
             df['cpu_util'] = pd.to_numeric(df['cpu_util'], errors='coerce').fillna(50)
-        else:
-            df['cpu_util'] = np.random.uniform(10, 90, len(df))
         
-        if 'memory_util' in df.columns:
+        # Handle Memory utilization - Check for Memory_Consumption (MB) in your dataset
+        if 'memory_util' not in df.columns:
+            if 'Memory_Consumption (MB)' in df.columns:
+                # Convert MB to percentage (assuming max 8192 MB)
+                df['memory_util'] = (df['Memory_Consumption (MB)'] / 8192) * 100
+                df['memory_util'] = df['memory_util'].clip(0, 100)
+                logger.info("Using Memory_Consumption (MB) as memory_util")
+            else:
+                df['memory_util'] = df['cpu_util'] * 0.7 + np.random.normal(0, 5, len(df))
+                df['memory_util'] = df['memory_util'].clip(0, 100)
+        else:
             df['memory_util'] = pd.to_numeric(df['memory_util'], errors='coerce').fillna(50)
-        else:
-            df['memory_util'] = df['cpu_util'] * 0.7 + np.random.normal(0, 5, len(df))
-            df['memory_util'] = df['memory_util'].clip(0, 100)
         
+        # Add derived features
+        if 'disk_io' not in df.columns:
+            df['disk_io'] = df['cpu_util'] * np.random.uniform(0.5, 1.5, len(df))
+        
+        if 'network_traffic' not in df.columns:
+            if 'Network_Bandwidth_Utilization (Mbps)' in df.columns:
+                df['network_traffic'] = pd.to_numeric(df['Network_Bandwidth_Utilization (Mbps)'], errors='coerce').fillna(0)
+                logger.info("Using Network_Bandwidth_Utilization (Mbps) as network_traffic")
+            else:
+                df['network_traffic'] = df['memory_util'] * np.random.uniform(0.3, 1.2, len(df))
+        
+        if 'queue_length' not in df.columns:
+            if 'Task_Waiting_Time (ms)' in df.columns:
+                df['queue_length'] = (df['Task_Waiting_Time (ms)'] / 100).astype(int)
+                logger.info("Using Task_Waiting_Time (ms) as queue_length")
+            else:
+                df['queue_length'] = (df['cpu_util'] / 20).astype(int)
+        
+        if 'response_time' not in df.columns:
+            if 'Task_Execution_Time (ms)' in df.columns:
+                df['response_time'] = pd.to_numeric(df['Task_Execution_Time (ms)'], errors='coerce').fillna(50)
+                logger.info("Using Task_Execution_Time (ms) as response_time")
+            else:
+                df['response_time'] = 50 + df['cpu_util'] * 2
+        
+        # Extract time features
         df['hour_of_day'] = df['timestamp'].dt.hour
         df['day_of_week'] = df['timestamp'].dt.dayofweek
-        df['load_score'] = 0.4 * (df['cpu_util'] / 100) + 0.3 * (df['memory_util'] / 100)
+        
+        # Calculate load score
+        df['load_score'] = (
+            0.4 * (df['cpu_util'] / 100) +
+            0.3 * (df['memory_util'] / 100) +
+            0.2 * (df['response_time'] / 500) +
+            0.1 * (df['queue_length'] / 10)
+        )
         
         # Add status based on load
         df['status'] = df['load_score'].apply(lambda x: 'Critical' if x > 0.8 else ('High' if x > 0.6 else ('Normal' if x > 0.3 else 'Idle')))
         
-        if len(df) > sample_size:
+        # DON'T SAMPLE - Keep all data if sample_size is None
+        if sample_size is not None and len(df) > sample_size:
             df = df.sample(n=sample_size, random_state=42).sort_values('timestamp')
+            logger.info(f"Sampled data to {len(df)} records")
         
-        logger.info(f"Preprocessed data shape: {df.shape}")
+        logger.info(f"Final preprocessed data shape: {df.shape}")
+        logger.info(f"Columns: {df.columns.tolist()}")
+        logger.info(f"Unique VMs: {df['vm_id'].nunique()}")
+        
         return df
 
 
@@ -147,8 +234,9 @@ class OptimizedNeuralNetworkModels:
         y_list = []
         
         vms = data['vm_id'].unique()
+        logger.info(f"Training on {len(vms)} VMs")
         
-        for vm_id in vms[:5]:
+        for vm_id in vms:  # Use ALL VMs — previously sliced to [:10] but each VM had only 1 record
             vm_data = data[data['vm_id'] == vm_id].sort_values('timestamp')
             features = vm_data[feature_cols].values
             targets = vm_data['cpu_util'].values
@@ -169,6 +257,8 @@ class OptimizedNeuralNetworkModels:
         X_lstm = np.array(X_lstm_list)
         X_fnn = np.array(X_fnn_list)
         y = np.array(y_list)
+        
+        logger.info(f"Training data shape: X_lstm={X_lstm.shape}, X_fnn={X_fnn.shape}, y={y.shape}")
         
         X_lstm_reshaped = X_lstm.reshape(-1, X_lstm.shape[-1])
         X_lstm_scaled = self.scaler.fit_transform(X_lstm_reshaped)
@@ -272,7 +362,7 @@ class RealTimeDatasetPlayer:
         self.current_index = 0
         self.running = False
         self.playback_thread = None
-        self.data_buffer = deque(maxlen=500)
+        self.data_buffer = deque(maxlen=1000)  # Increased buffer
         self.manual_loads = {}
         
     def start_playback(self):
@@ -356,7 +446,7 @@ class RealTimeDatasetPlayer:
                 if 0 < time_diff < 60:
                     time.sleep(time_diff)
                 else:
-                    time.sleep(0.1)
+                    time.sleep(0.05)  # Faster playback for large datasets
     
     def get_current_data(self):
         if len(self.data_buffer) > 0:
@@ -404,22 +494,41 @@ class RealDatasetLoadBalancer:
         self.setup_routes()
         self.setup_socket_events()
         
-    def load_dataset(self):
+    def load_dataset(self, file_path=None):
         logger.info("Loading dataset...")
         
-        if os.path.exists('data/realistic_cloud_workload.csv'):
+        # Try to load from specified path
+        if file_path and os.path.exists(file_path):
+            logger.info(f"Loading from specified path: {file_path}")
+            self.data = self.dataset_loader.load_local_dataset(file_path)
+        
+        # Try to load your dataset first
+        elif os.path.exists('data/cloud_workload_dataset.csv'):
+            logger.info("Loading your cloud workload dataset...")
+            self.data = self.dataset_loader.load_local_dataset('data/cloud_workload_dataset.csv')
+        
+        # Try other datasets
+        elif os.path.exists('data/realistic_cloud_workload.csv'):
+            logger.info("Loading realistic cloud workload dataset...")
             self.data = self.dataset_loader.load_local_dataset('data/realistic_cloud_workload.csv')
+        
+        elif os.path.exists('data/generated_sample.csv'):
+            logger.info("Loading generated sample dataset...")
+            self.data = self.dataset_loader.load_local_dataset('data/generated_sample.csv')
+        
         elif os.path.exists('data/'):
             csv_files = glob.glob('data/*.csv')
             if csv_files:
+                logger.info(f"Loading first CSV found: {csv_files[0]}")
                 self.data = self.dataset_loader.load_local_dataset(csv_files[0])
         
         if self.data is None:
-            logger.info("Generating sample data...")
+            logger.info("No dataset found, generating sample data...")
             self.data = self._generate_sample_data()
         
         if self.data is not None:
-            self.data = self.dataset_loader.preprocess_data(self.data)
+            # Preprocess without sampling to keep all data
+            self.data = self.dataset_loader.preprocess_data(self.data, sample_size=None)
             self.dataset_player = RealTimeDatasetPlayer(self.data)
             logger.info(f"Loaded {len(self.data)} records")
             return True
@@ -660,7 +769,6 @@ class RealDatasetLoadBalancer:
                         lstm_pred = self.nn_models.get_lstm_prediction(recent) if len(recent) > 10 else None
                         fnn_pred = self.nn_models.get_fnn_prediction(recent) if len(recent) > 0 else None
                         
-                        # Convert all numpy types to Python native types
                         data = {
                             'timestamp': str(current['timestamp']),
                             'vm_id': str(current['vm_id']),
@@ -689,13 +797,22 @@ class RealDatasetLoadBalancer:
     
     def run(self, host='0.0.0.0', port=5000):
         print("\n" + "="*70)
-        print("🚀 AI-DRIVEN LOAD BALANCER - Fixed JSON Serialization")
+        print("🚀 AI-DRIVEN LOAD BALANCER - Full Dataset Version")
         print("="*70)
         
         print("\n📁 Loading dataset...")
         if not self.load_dataset():
             print("❌ Failed to load dataset")
             return
+        
+        print("\n📊 Dataset Statistics:")
+        if self.data is not None:
+            print(f"   - Total Records: {len(self.data):,}")
+            print(f"   - Unique VMs: {self.data['vm_id'].nunique()}")
+            print(f"   - Average CPU: {self.data['cpu_util'].mean():.2f}%")
+            print(f"   - Average Memory: {self.data['memory_util'].mean():.2f}%")
+            print(f"   - Load Score Range: {self.data['load_score'].min():.3f} - {self.data['load_score'].max():.3f}")
+            print(f"   - Time Range: {self.data['timestamp'].min()} to {self.data['timestamp'].max()}")
         
         print("\n🤖 Training Unified Model...")
         self.train_models()
@@ -705,8 +822,8 @@ class RealDatasetLoadBalancer:
         print(f"\n🌐 Server: http://{host}:{port}")
         print("\n📊 FEATURES:")
         print("   1. UNIFIED MODEL: LSTM + FNN combined")
-        print("   2. CONSISTENT PREDICTIONS: Same result every click")
-        print("   3. FIXED JSON SERIALIZATION: No more int32 errors")
+        print("   2. FULL DATASET: All records loaded (no sampling)")
+        print("   3. CONSISTENT PREDICTIONS: Same result every click")
         print("   4. REAL-TIME STATUS: Critical/High/Normal/Idle indicators")
         print("   5. MANUAL LOAD: Visual spikes with duration tracking")
         print("   6. REFRESH: Clear spikes and update data")
@@ -717,6 +834,7 @@ class RealDatasetLoadBalancer:
     def _create_dashboard(self):
         os.makedirs('templates', exist_ok=True)
         
+        # Dashboard HTML (same as before, keep as is)
         dashboard_html = """<!DOCTYPE html>
 <html>
 <head>
@@ -990,7 +1108,7 @@ class RealDatasetLoadBalancer:
         
         function connectSocket() {
             socket = io();
-            socket.on('connect', () => showMessage('✅ Connected to AI Load Balancer', 'success'));
+            socket.on('connect', () => showMessage('✅ Connected', 'success'));
             socket.on('data_update', (data) => updateDisplay(data));
             socket.on('disconnect', () => showMessage('❌ Disconnected', 'error'));
         }
@@ -1130,14 +1248,50 @@ class RealDatasetLoadBalancer:
         with codecs.open('templates/fixed_dashboard.html', 'w', encoding='utf-8') as f:
             f.write(dashboard_html)
         
-        logger.info("Fixed dashboard created")
+        logger.info("Dashboard created")
 
 
 if __name__ == "__main__":
     os.makedirs('data', exist_ok=True)
+    
+    print("\n" + "="*70)
+    print("AI-Driven Load Balancer - Full Dataset Version")
+    print("="*70)
+    
+    # Check for your dataset
+    dataset_path = 'data/cloud_workload_dataset.csv'
+    if os.path.exists(dataset_path):
+        file_size = os.path.getsize(dataset_path) / 1024
+        print(f"\n✅ Found your dataset: {dataset_path}")
+        print(f"   File size: {file_size:.2f} KB")
+        
+        # Count records roughly (optional)
+        try:
+            with open(dataset_path, 'r') as f:
+                lines = sum(1 for _ in f) - 1  # Subtract header
+                print(f"   Estimated records: {lines:,}")
+        except:
+            pass
+    else:
+        print(f"\n⚠️ Dataset not found at {dataset_path}")
+        print("   Please place your cloud_workload_dataset.csv in the 'data' folder")
+        print("   Make sure the file name is exactly: cloud_workload_dataset.csv")
+        print("   The system will generate sample data for now\n")
+    
     balancer = RealDatasetLoadBalancer()
+    
     try:
+        # Try to load your dataset if it exists
+        if os.path.exists(dataset_path):
+            print("\n📊 Loading your dataset...")
+            balancer.load_dataset(dataset_path)
+        else:
+            print("\n📊 Generating sample data...")
+            balancer.load_dataset()
+        
+        balancer.train_models()
         balancer.run()
+        
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
     except Exception as e:
